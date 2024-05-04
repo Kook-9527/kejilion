@@ -17,10 +17,12 @@ install() {
 
     for package in "$@"; do
         if ! command -v "$package" &>/dev/null; then
-            if command -v apt &>/dev/null; then
-                apt update -y && apt install -y "$package"
+            if command -v dnf &>/dev/null; then
+                dnf -y update && dnf install -y "$package"
             elif command -v yum &>/dev/null; then
                 yum -y update && yum -y install "$package"
+            elif command -v apt &>/dev/null; then
+                apt update -y && apt install -y "$package"
             elif command -v apk &>/dev/null; then
                 apk update && apk add "$package"
             else
@@ -47,12 +49,14 @@ remove() {
     fi
 
     for package in "$@"; do
-        if command -v apt &>/dev/null; then
-            apt purge -y "$package"
+        if command -v dnf &>/dev/null; then
+            dnf remove -y "${package}*"
         elif command -v yum &>/dev/null; then
-            yum remove -y "$package"
+            yum remove -y "${package}*"
+        elif command -v apt &>/dev/null; then
+            apt purge -y "${package}*"
         elif command -v apk &>/dev/null; then
-            apk del "$package"
+            apk del "${package}*"
         else
             echo "未知的包管理器!"
             return 1
@@ -114,6 +118,8 @@ install_add_docker() {
         systemctl start docker
         systemctl enable docker
     fi
+
+    sleep 2
 }
 
 install_docker() {
@@ -138,7 +144,50 @@ iptables_open() {
 
 }
 
+
+
+add_swap() {
+    # 获取当前系统中所有的 swap 分区
+    swap_partitions=$(grep -E '^/dev/' /proc/swaps | awk '{print $1}')
+
+    # 遍历并删除所有的 swap 分区
+    for partition in $swap_partitions; do
+      swapoff "$partition"
+      wipefs -a "$partition"  # 清除文件系统标识符
+      mkswap -f "$partition"
+    done
+
+    # 确保 /swapfile 不再被使用
+    swapoff /swapfile
+
+    # 删除旧的 /swapfile
+    rm -f /swapfile
+
+    # 创建新的 swap 分区
+    dd if=/dev/zero of=/swapfile bs=1M count=$new_swap
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+
+    if [ -f /etc/alpine-release ]; then
+        echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+        echo "nohup swapon /swapfile" >> /etc/local.d/swap.start
+        chmod +x /etc/local.d/swap.start
+        rc-update add local
+    else
+        echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+    fi
+
+    echo "虚拟内存大小已调整为${new_swap}MB"
+}
+
+
+
 install_ldnmp() {
+
+      new_swap=1024
+      add_swap
+
       cd /home/web && docker-compose up -d
       clear
       echo "正在配置LDNMP环境，请耐心稍等……"
@@ -285,7 +334,8 @@ install_ssltls() {
       iptables_open
       cd ~
       certbot certonly --standalone -d $yuming --email your@email.com --agree-tos --no-eff-email --force-renewal
-      cp /etc/letsencrypt/live/$yuming/cert.pem /home/web/certs/${yuming}_cert.pem
+      # cp /etc/letsencrypt/live/$yuming/cert.pem /home/web/certs/${yuming}_cert.pem
+      cp /etc/letsencrypt/live/$yuming/fullchain.pem /home/web/certs/${yuming}_cert.pem
       cp /etc/letsencrypt/live/$yuming/privkey.pem /home/web/certs/${yuming}_key.pem
       docker start nginx > /dev/null 2>&1
 }
@@ -469,6 +519,91 @@ tmux_run() {
 }
 
 
+f2b_status() {
+     docker restart fail2ban
+     sleep 3
+     docker exec -it fail2ban fail2ban-client status
+}
+
+f2b_status_xxx() {
+    docker exec -it fail2ban fail2ban-client status $xxx
+}
+
+f2b_install_sshd() {
+
+    docker run -d \
+        --name=fail2ban \
+        --net=host \
+        --cap-add=NET_ADMIN \
+        --cap-add=NET_RAW \
+        -e PUID=1000 \
+        -e PGID=1000 \
+        -e TZ=Etc/UTC \
+        -e VERBOSITY=-vv \
+        -v /path/to/fail2ban/config:/config \
+        -v /var/log:/var/log:ro \
+        -v /home/web/log/nginx/:/remotelogs/nginx:ro \
+        --restart unless-stopped \
+        lscr.io/linuxserver/fail2ban:latest
+
+    sleep 3
+    if grep -q 'Alpine' /etc/issue; then
+        cd /path/to/fail2ban/config/fail2ban/filter.d
+        curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/alpine-sshd.conf
+        curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/alpine-sshd-ddos.conf
+        cd /path/to/fail2ban/config/fail2ban/jail.d/
+        curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/alpine-ssh.conf
+    elif grep -qi 'CentOS' /etc/redhat-release; then
+        cd /path/to/fail2ban/config/fail2ban/jail.d/
+        curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/centos-ssh.conf
+    else
+        install rsyslog
+        systemctl start rsyslog
+        systemctl enable rsyslog
+        cd /path/to/fail2ban/config/fail2ban/jail.d/
+        curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/linux-ssh.conf
+    fi
+}
+
+f2b_sshd() {
+    if grep -q 'Alpine' /etc/issue; then
+        xxx=alpine-sshd
+        f2b_status_xxx
+    elif grep -qi 'CentOS' /etc/redhat-release; then
+        xxx=centos-sshd
+        f2b_status_xxx
+    else
+        xxx=linux-sshd
+        f2b_status_xxx
+    fi
+}
+
+
+
+
+
+
+server_reboot() {
+
+    read -p "确定现在重启服务器吗？(Y/N): " rboot
+    case "$rboot" in
+      [Yy])
+        echo "已重启"
+        reboot
+        ;;
+      [Nn])
+        echo "已取消"
+        ;;
+      *)
+        echo "无效的选择，请输入 Y 或 N。"
+        ;;
+    esac
+
+
+}
+
+
+
 
 
 
@@ -480,7 +615,7 @@ echo -e "\033[96m_  _ ____  _ _ _    _ ____ _  _ "
 echo "|_/  |___  | | |    | |  | |\ | "
 echo "| \_ |___ _| | |___ | |__| | \| "
 echo "                                "
-echo -e "\033[96m科技lion一键脚本工具 v2.3.2 （支持Ubuntu/Debian/CentOS/Alpine系统）\033[0m"
+echo -e "\033[96m科技lion一键脚本工具 v2.4.2 （支持Ubuntu/Debian/CentOS/Alpine系统）\033[0m"
 echo -e "\033[96m-输入\033[93mk\033[96m可快速启动此脚本-\033[0m"
 echo "------------------------"
 echo "1. 系统信息查询"
@@ -1325,17 +1460,28 @@ EOF
     while true; do
       clear
       echo "▶ 测试脚本合集"
-      echo "------------------------"
+      echo ""
+      echo "----解锁状态检测-----------"
       echo "1. ChatGPT解锁状态检测"
       echo "2. Region流媒体解锁测试"
       echo "3. yeahwu流媒体解锁检测"
-      echo "4. besttrace三网回程延迟路由测试"
-      echo "5. mtr_trace三网回程线路测试"
-      echo "6. Superspeed三网测速"
-      echo "7. yabs性能带宽测试"
-      echo "8. bench性能测试"
-      echo "------------------------"
-      echo -e "9. spiritysdx融合怪测评 \033[33mNEW\033[0m"
+      echo ""
+      echo "----网络线路测速-----------"
+      echo "11. besttrace三网回程延迟路由测试"
+      echo "12. mtr_trace三网回程线路测试"
+      echo "13. Superspeed三网测速"
+      echo "14. nxtrace快速回程测试脚本"
+      echo "15. nxtrace指定IP回程测试脚本"
+      echo "16. ludashi2020三网线路测试"
+      echo ""
+      echo "----硬件性能测试----------"
+      echo "21. yabs性能测试"
+      echo "22. icu/gb5 CPU性能测试脚本"
+      echo ""
+      echo "----综合性测试-----------"
+      echo "31. bench性能测试"
+      echo "32. spiritysdx融合怪测评"
+      echo ""
       echo "------------------------"
       echo "0. 返回主菜单"
       echo "------------------------"
@@ -1355,31 +1501,75 @@ EOF
               install wget
               wget -qO- https://hub.gitmirror.com/https://github.com/yeahwu/check/raw/main/check.sh | bash
               ;;
-          4)
+          11)
               clear
               install wget
               wget -qO- git.io/besttrace | bash
               ;;
-          5)
+          12)
               clear
               curl https://raw.gitmirror.com/zhucaidan/mtr_trace/main/mtr_trace.sh | bash
               ;;
-          6)
+          13)
               clear
               bash <(curl -Lso- https://git.io/superspeed_uxh)
               ;;
-          7)
+          14)
+              clear
+              curl nxtrace.org/nt |bash
+              nexttrace --fast-trace --tcp
+              ;;
+          15)
+              clear
+
+              echo "可参考的IP列表"
+              echo "------------------------"
+              echo "北京电信: 219.141.136.12"
+              echo "北京联通: 202.106.50.1"
+              echo "北京移动: 221.179.155.161"
+              echo "上海电信: 202.96.209.133"
+              echo "上海联通: 210.22.97.1"
+              echo "上海移动: 211.136.112.200"
+              echo "广州电信: 58.60.188.222"
+              echo "广州联通: 210.21.196.6"
+              echo "广州移动: 120.196.165.24"
+              echo "成都电信: 61.139.2.69"
+              echo "成都联通: 119.6.6.6"
+              echo "成都移动: 211.137.96.205"
+              echo "湖南电信: 36.111.200.100"
+              echo "湖南联通: 42.48.16.100"
+              echo "湖南移动: 39.134.254.6"
+              echo "------------------------"
+
+              read -p "输入一个指定IP: " testip
+              curl nxtrace.org/nt |bash
+              nexttrace $testip
+              ;;
+
+          16)
+              clear
+              curl https://raw.gitmirror.com/ludashi2020/backtrace/main/install.sh -sSf | sh
+              ;;
+
+          21)
               clear
               curl -sL yabs.sh | bash -s -- -i -5
               ;;
-          8)
+          22)
+              clear
+              bash <(curl -sL bash.icu/gb5)
+              ;;
+
+          31)
               clear
               curl -Lso- bench.sh | bash
               ;;
-          9)
+          32)
               clear
               curl -L https://gitlab.com/spiritysdx/za/-/raw/main/ecs.sh -o ecs.sh && chmod +x ecs.sh && bash ecs.sh
               ;;
+
+
           0)
               kejilion
 
@@ -1492,18 +1682,8 @@ EOF
               sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config;
               service sshd restart
               echo "ROOT登录设置完毕！"
-              read -p "需要重启服务器吗？(Y/N): " choice
-          case "$choice" in
-            [Yy])
-              reboot
-              ;;
-            [Nn])
-              echo "已取消"
-              ;;
-            *)
-              echo "无效的选择，请输入 Y 或 N。"
-              ;;
-          esac
+              server_reboot
+
               ;;
           0)
               kejilion
@@ -1532,7 +1712,6 @@ EOF
     echo  "4. 安装可道云桌面"
     echo  "5. 安装苹果CMS网站"
     echo  "6. 安装独角数发卡网"
-    echo  "7. 安装BingChatAI聊天网站"
     echo  "8. 安装flarum论坛网站"
     echo  "9. 安装Bitwarden密码管理平台"
     echo  "10. 安装Halo博客网站"
@@ -1703,10 +1882,10 @@ EOF
       mkdir $yuming
       cd $yuming
       wget https://hub.gitmirror.com/https://github.com/magicblack/maccms_down/raw/master/maccms10.zip && unzip maccms10.zip && rm maccms10.zip
-      cd /home/web/html/$yuming/maccms10-master/template/ && wget https://hub.gitmirror.com/https://github.com/kejilion/Website_source_code/raw/main/DYXS2.zip && unzip DYXS2.zip && rm /home/web/html/$yuming/maccms10-master/template/DYXS2.zip
-      cp /home/web/html/$yuming/maccms10-master/template/DYXS2/asset/admin/Dyxs2.php /home/web/html/$yuming/maccms10-master/application/admin/controller
-      cp /home/web/html/$yuming/maccms10-master/template/DYXS2/asset/admin/dycms.html /home/web/html/$yuming/maccms10-master/application/admin/view/system
-      mv /home/web/html/$yuming/maccms10-master/admin.php /home/web/html/$yuming/maccms10-master/vip.php && wget -O /home/web/html/$yuming/maccms10-master/application/extra/maccms.php https://raw.gitmirror.com/kejilion/Website_source_code/main/maccms.php
+      cd /home/web/html/$yuming/template/ && wget https://hub.gitmirror.com/https://github.com/kejilion/Website_source_code/raw/main/DYXS2.zip && unzip DYXS2.zip && rm /home/web/html/$yuming/template/DYXS2.zip
+      cp /home/web/html/$yuming/template/DYXS2/asset/admin/Dyxs2.php /home/web/html/$yuming/application/admin/controller
+      cp /home/web/html/$yuming/template/DYXS2/asset/admin/dycms.html /home/web/html/$yuming/application/admin/view/system
+      mv /home/web/html/$yuming/admin.php /home/web/html/$yuming/vip.php && wget -O /home/web/html/$yuming/application/extra/maccms.php https://raw.gitmirror.com/kejilion/Website_source_code/main/maccms.php
 
       restart_ldnmp
 
@@ -1771,22 +1950,6 @@ EOF
       echo "登录时右上角如果出现红色error0请使用如下命令: "
       echo "我也很气愤独角数卡为啥这么麻烦，会有这样的问题！"
       echo "sed -i 's/ADMIN_HTTPS=false/ADMIN_HTTPS=true/g' /home/web/html/$yuming/dujiaoka/.env"
-      nginx_status
-        ;;
-
-      7)
-      clear
-      # BingChat
-      add_yuming
-      install_ssltls
-
-      docker run -d -p 3099:8080 --name go-proxy-bingai --restart=unless-stopped adams549659584/go-proxy-bingai
-      duankou=3099
-      reverse_proxy
-
-      clear
-      echo "您的BingChat网站搭建好了！"
-      echo "https://$yuming"
       nginx_status
         ;;
 
@@ -1857,7 +2020,7 @@ EOF
       add_yuming
       install_ssltls
 
-      docker run -d --name halo --restart always --network web_default -p 8010:8090 -v /home/web/html/$yuming/.halo2:/root/.halo2 halohub/halo:2.11
+      docker run -d --name halo --restart always --network web_default -p 8010:8090 -v /home/web/html/$yuming/.halo2:/root/.halo2 halohub/halo:2
       duankou=8010
       reverse_proxy
 
@@ -2047,7 +2210,7 @@ EOF
         echo "操作"
         echo "------------------------"
         echo "1. 申请/更新域名证书               2. 更换站点域名"
-        echo -e "3. 清理站点缓存                    4. 查看站点分析报告 \033[33mNEW\033[0m"
+        echo "3. 清理站点缓存                    4. 查看站点分析报告"
         echo "------------------------"
         echo "7. 删除指定站点                    8. 删除指定数据库"
         echo "------------------------"
@@ -2064,13 +2227,16 @@ EOF
             2)
                 read -p "请输入旧域名: " oddyuming
                 read -p "请输入新域名: " yuming
+                install_ssltls
                 mv /home/web/conf.d/$oddyuming.conf /home/web/conf.d/$yuming.conf
                 sed -i "s/$oddyuming/$yuming/g" /home/web/conf.d/$yuming.conf
                 mv /home/web/html/$oddyuming /home/web/html/$yuming
 
                 rm /home/web/certs/${oddyuming}_key.pem
                 rm /home/web/certs/${oddyuming}_cert.pem
-                install_ssltls
+
+                docker restart nginx
+
 
                 ;;
 
@@ -2078,6 +2244,10 @@ EOF
             3)
                 docker exec -it nginx rm -rf /var/cache/nginx
                 docker restart nginx
+                docker exec php php -r 'opcache_reset();'
+                docker restart php
+                docker exec php74 php -r 'opcache_reset();'
+                docker restart php74
                 ;;
             4)
                 install goaccess
@@ -2186,12 +2356,14 @@ EOF
       install_dependency
       install_docker
       install_certbot
+
       install_ldnmp
 
       ;;
 
     35)
-      if [ -x "$(command -v fail2ban-client)" ] && [ -d "/etc/fail2ban" ]; then
+
+        if docker inspect fail2ban &>/dev/null || [ -x "$(command -v fail2ban-client)" ]; then
           while true; do
               clear
               echo "服务器防御程序已启动"
@@ -2202,6 +2374,10 @@ EOF
               echo "5. 查看SSH拦截记录                6. 查看网站拦截记录"
               echo "7. 查看防御规则列表               8. 查看日志实时监控"
               echo "------------------------"
+              echo "11. 配置拦截参数"
+              echo "------------------------"
+              echo "21. cloudflare模式"
+              echo "------------------------"
               echo "9. 卸载防御程序"
               echo "------------------------"
               echo "0. 退出"
@@ -2209,59 +2385,101 @@ EOF
               read -p "请输入你的选择: " sub_choice
               case $sub_choice in
                   1)
-                      sed -i 's/false/true/g' /etc/fail2ban/jail.d/sshd.local
-                      systemctl restart fail2ban
-                      sleep 1
-                      fail2ban-client status
+                      sed -i 's/false/true/g' /path/to/fail2ban/config/fail2ban/jail.d/alpine-ssh.conf
+                      sed -i 's/false/true/g' /path/to/fail2ban/config/fail2ban/jail.d/linux-ssh.conf
+                      sed -i 's/false/true/g' /path/to/fail2ban/config/fail2ban/jail.d/centos-ssh.conf
+                      f2b_status
                       ;;
                   2)
-                      sed -i 's/true/false/g' /etc/fail2ban/jail.d/sshd.local
-                      systemctl restart fail2ban
-                      sleep 1
-                      fail2ban-client status
+                      sed -i 's/true/false/g' /path/to/fail2ban/config/fail2ban/jail.d/alpine-ssh.conf
+                      sed -i 's/true/false/g' /path/to/fail2ban/config/fail2ban/jail.d/linux-ssh.conf
+                      sed -i 's/true/false/g' /path/to/fail2ban/config/fail2ban/jail.d/centos-ssh.conf
+                      f2b_status
                       ;;
                   3)
-                      sed -i 's/false/true/g' /etc/fail2ban/jail.d/nginx.local
-                      systemctl restart fail2ban
-                      sleep 1
-                      fail2ban-client status
+                      sed -i 's/false/true/g' /path/to/fail2ban/config/fail2ban/jail.d/nginx-docker-cc.conf
+                      f2b_status
                       ;;
                   4)
-                      sed -i 's/true/false/g' /etc/fail2ban/jail.d/nginx.local
-                      systemctl restart fail2ban
-                      sleep 1
-                      fail2ban-client status
+                      sed -i 's/true/false/g' /path/to/fail2ban/config/fail2ban/jail.d/nginx-docker-cc.conf
+                      f2b_status
                       ;;
                   5)
                       echo "------------------------"
-                      fail2ban-client status sshd
+                      f2b_sshd
                       echo "------------------------"
                       ;;
                   6)
+
                       echo "------------------------"
-                      fail2ban-client status nginx-bad-request
+                      xxx=fail2ban-nginx-cc
+                      f2b_status_xxx
                       echo "------------------------"
-                      fail2ban-client status nginx-botsearch
+                      xxx=docker-nginx-bad-request
+                      f2b_status_xxx
                       echo "------------------------"
-                      fail2ban-client status nginx-http-auth
+                      xxx=docker-nginx-botsearch
+                      f2b_status_xxx
                       echo "------------------------"
-                      fail2ban-client status nginx-limit-req
+                      xxx=docker-nginx-http-auth
+                      f2b_status_xxx
                       echo "------------------------"
-                      fail2ban-client status php-url-fopen
+                      xxx=docker-nginx-limit-req
+                      f2b_status_xxx
                       echo "------------------------"
+                      xxx=docker-php-url-fopen
+                      f2b_status_xxx
+                      echo "------------------------"
+
                       ;;
 
                   7)
-                      fail2ban-client status
+                      docker exec -it fail2ban fail2ban-client status
                       ;;
                   8)
-                      tail -f /var/log/fail2ban.log
+                      tail -f /path/to/fail2ban/config/log/fail2ban/fail2ban.log
+                      break
 
                       ;;
                   9)
+                      docker rm -f fail2ban
+                      rm -rf /path/to/fail2ban
                       remove fail2ban
+                      rm -rf /etc/fail2ban
+                      echo "重启后生效"
+                      server_reboot
                       break
                       ;;
+
+                  11)
+                      install nano
+                      nano /path/to/fail2ban/config/fail2ban/jail.d/nginx-docker-cc.conf
+                      f2b_status
+
+                      break
+                      ;;
+                  21)
+                      echo "到cf后台右上角我的个人资料，选择左侧API令牌，获取Global API Key"
+                      echo "https://dash.cloudflare.com/login"
+                      read -p "输入CF的账号: " cfuser
+                      read -p "输入CF的Global API Key: " cftoken
+
+                      wget -O /home/web/conf.d/default.conf https://raw.gitmirror.com/kejilion/nginx/main/default11.conf
+                      docker restart nginx
+
+                      cd /path/to/fail2ban/config/fail2ban/jail.d/
+                      curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf
+
+                      cd /path/to/fail2ban/config/fail2ban/action.d
+                      curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/cloudflare-docker.conf
+
+                      sed -i "s/kejilion@outlook.com/$cfuser/g" /path/to/fail2ban/config/fail2ban/action.d/cloudflare-docker.conf
+                      sed -i "s/APIKEY00000/$cftoken/g" /path/to/fail2ban/config/fail2ban/action.d/cloudflare-docker.conf
+                      f2b_status
+
+                      echo "已配置cloudflare模式，可在cf后台，站点-安全性-事件中查看拦截记录"
+                      ;;
+
                   0)
                       break
                       ;;
@@ -2274,54 +2492,28 @@ EOF
           done
       else
           clear
-          # 安装Fail2ban
-          if [ -f /etc/debian_version ]; then
-              # Debian/Ubuntu系统
-              install fail2ban
-          elif [ -f /etc/redhat-release ]; then
-              # CentOS系统
-              install epel-release fail2ban
-          else
-              echo "不支持的操作系统类型"
-              exit 1
-          fi
+          install_docker
 
-          # 启动Fail2ban
-          systemctl start fail2ban
-
-          # 设置Fail2ban开机自启
-          systemctl enable fail2ban
-
-          # 配置Fail2ban
-          rm -rf /etc/fail2ban/jail.d/*
-          cd /etc/fail2ban/jail.d/
-          curl -sS -O https://raw.gitmirror.com/kejilion/sh/main/sshd.local
-          systemctl restart fail2ban
           docker rm -f nginx
-
           wget -O /home/web/nginx.conf https://raw.gitmirror.com/kejilion/nginx/main/nginx10.conf
           wget -O /home/web/conf.d/default.conf https://raw.gitmirror.com/kejilion/nginx/main/default10.conf
           default_server_ssl
           docker run -d --name nginx --restart always --network web_default -p 80:80 -p 443:443 -p 443:443/udp -v /home/web/nginx.conf:/etc/nginx/nginx.conf -v /home/web/conf.d:/etc/nginx/conf.d -v /home/web/certs:/etc/nginx/certs -v /home/web/html:/var/www/html -v /home/web/log/nginx:/var/log/nginx nginx:alpine
           docker exec -it nginx chmod -R 777 /var/www/html
 
-          # 获取宿主机当前时区
-          HOST_TIMEZONE=$(timedatectl show --property=Timezone --value)
+          f2b_install_sshd
 
-          # 调整多个容器的时区
-          docker exec -it nginx ln -sf "/usr/share/zoneinfo/$HOST_TIMEZONE" /etc/localtime
-          docker exec -it php ln -sf "/usr/share/zoneinfo/$HOST_TIMEZONE" /etc/localtime
-          docker exec -it php74 ln -sf "/usr/share/zoneinfo/$HOST_TIMEZONE" /etc/localtime
-          docker exec -it mysql ln -sf "/usr/share/zoneinfo/$HOST_TIMEZONE" /etc/localtime
-          docker exec -it redis ln -sf "/usr/share/zoneinfo/$HOST_TIMEZONE" /etc/localtime
-          rm -rf /home/web/log/nginx/*
-          docker restart nginx
+          cd /path/to/fail2ban/config/fail2ban/filter.d
+          curl -sS -O https://raw.gitmirror.com/kejilion/sh/main/fail2ban-nginx-cc.conf
+          cd /path/to/fail2ban/config/fail2ban/jail.d/
+          curl -sS -O https://raw.gitmirror.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf
+          sed -i "/cloudflare/d" /path/to/fail2ban/config/fail2ban/jail.d/nginx-docker-cc.conf
 
-          curl -sS -O https://raw.gitmirror.com/kejilion/sh/main/nginx.local
-          systemctl restart fail2ban
-          sleep 1
-          fail2ban-client status
-          echo "防御程序已开启"
+          cd ~
+          f2b_status
+
+          echo "防御程序已开启，建议 reboot 重启服务器，完美适配系统。"
+          server_reboot
       fi
 
         ;;
@@ -2340,6 +2532,12 @@ EOF
                   1)
                   # nginx调优
                   sed -i 's/worker_connections.*/worker_connections 1024;/' /home/web/nginx.conf
+
+                  # php调优
+                  wget -O /home/optimized_php.ini https://raw.gitmirror.com/kejilion/sh/main/optimized_php.ini
+                  docker cp /home/optimized_php.ini php:/usr/local/etc/php/conf.d/optimized_php.ini
+                  docker cp /home/optimized_php.ini php74:/usr/local/etc/php/conf.d/optimized_php.ini
+                  rm -rf /home/optimized_php.ini
 
                   # php调优
                   wget -O /home/www.conf https://raw.gitmirror.com/kejilion/sh/main/www-1.conf
@@ -2363,7 +2561,7 @@ EOF
                   2)
 
                   # nginx调优
-                  sed -i 's/worker_connections.*/worker_connections 8129;/' /home/web/nginx.conf
+                  sed -i 's/worker_connections.*/worker_connections 10240;/' /home/web/nginx.conf
 
                   # php调优
                   wget -O /home/www.conf https://raw.gitmirror.com/kejilion/sh/main/www.conf
@@ -2456,11 +2654,14 @@ EOF
       echo "17. AdGuardHome去广告软件               18. onlyoffice在线办公OFFICE"
       echo "19. 雷池WAF防火墙面板                   20. portainer容器管理面板"
       echo "21. VScode网页版                        22. UptimeKuma监控工具"
-      echo "23. Memos网页备忘录                     24. pandoranext潘多拉GPT镜像站"
+      echo "23. Memos网页备忘录                     24. Webtop远程桌面网页版"
       echo "25. Nextcloud网盘                       26. QD-Today定时任务管理框架"
       echo "27. Dockge容器堆栈管理面板              28. LibreSpeed测速工具"
       echo "29. searxng聚合搜索站                   30. PhotoPrism私有相册系统"
       echo "31. StirlingPDF工具大全                 32. drawio免费的在线图表软件"
+      echo "33. Sun-Panel导航面板"
+      echo "------------------------"
+      echo "51. PVE开小鸡面板"
       echo "------------------------"
       echo "0. 返回主菜单"
       echo "------------------------"
@@ -3399,122 +3600,33 @@ EOF
               ;;
 
           24)
+            docker_name="webtop"
+            docker_img="lscr.io/linuxserver/webtop:latest"
+            docker_port=3083
+            docker_rum="docker run -d \
+                          --name=webtop \
+                          --security-opt seccomp=unconfined \
+                          -e PUID=1000 \
+                          -e PGID=1000 \
+                          -e TZ=Etc/UTC \
+                          -e SUBFOLDER=/ \
+                          -e TITLE=Webtop \
+                          -e LC_ALL=zh_CN.UTF-8 \
+                          -e DOCKER_MODS=linuxserver/mods:universal-package-install \
+                          -e INSTALL_PACKAGES=font-noto-cjk \
+                          -p 3083:3000 \
+                          -v /home/docker/webtop/data:/config \
+                          -v /var/run/docker.sock:/var/run/docker.sock \
+                          --device /dev/dri:/dev/dri \
+                          --shm-size="1gb" \
+                          --restart unless-stopped \
+                          lscr.io/linuxserver/webtop:latest"
 
-            docker_name="PandoraNext"
-            docker_img="pengzhile/pandora-next"
-            docker_port=8181
-            docker_rum="docker run -d --restart always --name PandoraNext \
-                            -p 8181:8181 \
-                            -v /home/docker/PandoraNext/data:/data \
-                            -v /home/docker/PandoraNext/sessions:/root/.cache/PandoraNext \
-                            pengzhile/pandora-next"
-            docker_describe="pandora-next一个好用的GPT镜像站服务，国内也可以访问"
-            docker_url="官网介绍: https://hub.gitmirror.com/https://github.com/pandora-next/deploy"
-
-
-            if docker inspect "$docker_name" &>/dev/null; then
-                clear
-                echo "$docker_name 已安装，访问地址: "
-                ip_address
-                echo "http:$ipv4_address:$docker_port"
-                echo ""
-                echo "应用操作"
-                echo "------------------------"
-                echo "1. 更新应用             2. 卸载应用"
-                echo "3. 修改config           4. 修改tokens"
-                echo "------------------------"
-                echo "0. 返回上一级选单"
-                echo "------------------------"
-                read -p "请输入你的选择: " sub_choice
-
-                case $sub_choice in
-                    1)
-                        clear
-                        docker rm -f "$docker_name"
-                        docker rmi -f "$docker_img"
-
-                        $docker_rum
-                        clear
-                        echo "$docker_name 已经安装完成"
-                        echo "------------------------"
-                        # 获取外部 IP 地址
-                        ip_address
-                        echo "您可以使用以下地址访问:"
-                        echo "http:$ipv4_address:$docker_port"
-
-                        ;;
-                    2)
-                        clear
-                        docker rm -f "$docker_name"
-                        docker rmi -f "$docker_img"
-                        rm -rf "/home/docker/$docker_name"
-                        echo "应用已卸载"
-                        ;;
-                    3)
-                        clear
-                        nano /home/docker/PandoraNext/data/config.json
-                        echo "正在重启$docker_name"
-                        docker restart "$docker_name"
-
-                        ;;
-                    4)
-                        clear
-                        nano /home/docker/PandoraNext/data/tokens.json
-                        echo "正在重启$docker_name"
-                        docker restart "$docker_name"
-
-                        ;;
-                    0)
-                        # 跳出循环，退出菜单
-                        ;;
-                    *)
-                        # 跳出循环，退出菜单
-                        ;;
-                esac
-            else
-                clear
-                echo "安装提示"
-                echo "$docker_describe"
-                echo "$docker_url"
-                echo ""
-
-                # 提示用户确认安装
-                read -p "确定安装吗？(Y/N): " choice
-                case "$choice" in
-                    [Yy])
-                        clear
-                        echo "获取license_id请访问: https://dash.pandoranext.com/"
-                        read -p "请输入你的GitHub的license_id: " github1
-
-                        install_docker
-
-                        mkdir -p /home/docker/PandoraNext/{data,sessions}
-                        cd /home/docker/PandoraNext/data
-                        wget https://raw.gitmirror.com/kejilion/sh/main/PandoraNext/config.json
-                        wget https://raw.gitmirror.com/kejilion/sh/main/PandoraNext/tokens.json
-                        sed -i "s/github/$github1/g" /home/docker/PandoraNext/data/config.json
-                        webgptpasswd1=$(< /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c16)
-                        sed -i "s/webgptpasswd/$webgptpasswd1/g" /home/docker/PandoraNext/data/config.json
-
-                        $docker_rum
-                        clear
-                        echo "$docker_name 已经安装完成"
-                        echo "------------------------"
-                        # 获取外部 IP 地址
-                        ip_address
-                        echo "您可以使用以下地址访问:"
-                        echo "http:$ipv4_address:$docker_port"
-
-                        ;;
-                    [Nn])
-                        # 用户选择不安装
-                        ;;
-                    *)
-                        # 无效输入
-                        ;;
-                esac
-            fi
-
+            docker_describe="webtop基于 Alpine、Ubuntu、Fedora 和 Arch 的容器，包含官方支持的完整桌面环境，可通过任何现代 Web 浏览器访问"
+            docker_url="官网介绍: https://docs.linuxserver.io/images/docker-webtop/"
+            docker_use=""
+            docker_passwd=""
+            docker_app
               ;;
 
           25)
@@ -3645,7 +3757,27 @@ EOF
             docker_app
               ;;
 
+          33)
+            docker_name="sun-panel"
+            docker_img="hslr/sun-panel"
+            docker_port=3009
+            docker_rum="docker run -d --restart=always -p 3009:3002 \
+                            -v /home/docker/sun-panel/conf:/app/conf \
+                            -v /home/docker/sun-panel/uploads:/app/uploads \
+                            -v /home/docker/sun-panel/database:/app/database \
+                            --name sun-panel \
+                            hslr/sun-panel"
+            docker_describe="Sun-Panel服务器、NAS导航面板、Homepage、浏览器首页"
+            docker_url="官网介绍: https://doc.sun-panel.top/zh_cn/"
+            docker_use="echo \"账号: admin@sun.cc  密码: 12345678\""
+            docker_passwd=""
+            docker_app
+              ;;
 
+          51)
+          clear
+          curl -L https://raw.gitmirror.com/oneclickvirt/pve/main/scripts/install_pve.sh -o install_pve.sh && chmod +x install_pve.sh && bash install_pve.sh
+              ;;
           0)
               kejilion
               ;;
@@ -3786,13 +3918,15 @@ EOF
       echo "13. 用户管理"
       echo "14. 用户/密码生成器"
       echo "15. 系统时区调整"
-      echo "16. 开启BBR3加速"
+      echo "16. 设置BBR3加速"
       echo "17. 防火墙高级管理器"
       echo "18. 修改主机名"
       echo "19. 切换系统更新源"
-      echo -e "20. 定时任务管理 \033[33mNEW\033[0m"
+      echo "20. 定时任务管理"
+      echo "21. 本机host解析"
+      echo "22. fail2banSSH防御程序"
       echo "------------------------"
-      echo "21. 留言板"
+      echo "31. 留言板"
       echo "------------------------"
       echo "99. 重启服务器"
       echo "------------------------"
@@ -3822,18 +3956,8 @@ EOF
               sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config;
               service sshd restart
               echo "ROOT登录设置完毕！"
-              read -p "需要重启服务器吗？(Y/N): " choice
-          case "$choice" in
-            [Yy])
-              reboot
-              ;;
-            [Nn])
-              echo "已取消"
-              ;;
-            *)
-              echo "无效的选择，请输入 Y 或 N。"
-              ;;
-          esac
+              server_reboot
+
               ;;
 
           4)
@@ -4268,10 +4392,6 @@ EOF
 
           12)
 
-            if [ "$EUID" -ne 0 ]; then
-              echo "请以 root 权限运行此脚本。"
-              exit 1
-            fi
 
             clear
             # 获取当前交换空间信息
@@ -4294,40 +4414,8 @@ EOF
               [Yy])
                 # 输入新的虚拟内存大小
                 read -p "请输入虚拟内存大小MB: " new_swap
+                add_swap
 
-                # 获取当前系统中所有的 swap 分区
-                swap_partitions=$(grep -E '^/dev/' /proc/swaps | awk '{print $1}')
-
-                # 遍历并删除所有的 swap 分区
-                for partition in $swap_partitions; do
-                  swapoff "$partition"
-                  wipefs -a "$partition"  # 清除文件系统标识符
-                  mkswap -f "$partition"
-                  echo "已删除并重新创建 swap 分区: $partition"
-                done
-
-                # 确保 /swapfile 不再被使用
-                swapoff /swapfile
-
-                # 删除旧的 /swapfile
-                rm -f /swapfile
-
-                # 创建新的 swap 分区
-                dd if=/dev/zero of=/swapfile bs=1M count=$new_swap
-                chmod 600 /swapfile
-                mkswap /swapfile
-                swapon /swapfile
-
-                if [ -f /etc/alpine-release ]; then
-                    echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-                    echo "nohup swapon /swapfile" >> /etc/local.d/swap.start
-                    chmod +x /etc/local.d/swap.start
-                    rc-update add local
-                else
-                    echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
-                fi
-
-                echo "虚拟内存大小已调整为${new_swap}MB"
                 ;;
               [Nn])
                 echo "已取消"
@@ -4572,14 +4660,14 @@ EOF
                         rm -f /etc/apt/sources.list.d/xanmod-release.list
                         rm -f check_x86-64_psabi.sh*
 
-                        reboot
+                        server_reboot
 
                           ;;
                       2)
                         apt purge -y 'linux-*xanmod1*'
                         update-grub
                         echo "XanMod内核已卸载。重启后生效"
-                        reboot
+                        server_reboot
                           ;;
                       0)
                           break  # 跳出循环，退出菜单
@@ -4645,7 +4733,7 @@ EOF
             echo "XanMod内核安装并BBR3启用成功。重启后生效"
             rm -f /etc/apt/sources.list.d/xanmod-release.list
             rm -f check_x86-64_psabi.sh*
-            reboot
+            server_reboot
 
               ;;
             [Nn])
@@ -4755,8 +4843,6 @@ EOF
                       remove iptables-persistent
                       rm /etc/iptables/rules.v4
                       break
-                      # echo "防火墙已卸载，重启生效"
-                      # reboot
                           ;;
 
                       0)
@@ -4829,40 +4915,23 @@ EOF
 
           18)
           clear
-          # 获取当前主机名
           current_hostname=$(hostname)
-
           echo "当前主机名: $current_hostname"
-
-          # 询问用户是否要更改主机名
           read -p "是否要更改主机名？(y/n): " answer
-
           if [ "$answer" == "y" ]; then
               # 获取新的主机名
               read -p "请输入新的主机名: " new_hostname
-
-              # 更改主机名
               if [ -n "$new_hostname" ]; then
-                  # 根据发行版选择相应的命令
-                  if [ -f /etc/debian_version ]; then
-                      # Debian 或 Ubuntu
-                      hostnamectl set-hostname "$new_hostname"
-                      sed -i "s/$current_hostname/$new_hostname/g" /etc/hostname
-                  elif [ -f /etc/redhat-release ]; then
-                      # CentOS
-                      hostnamectl set-hostname "$new_hostname"
-                      sed -i "s/$current_hostname/$new_hostname/g" /etc/hostname
-                  elif [ -f /etc/alpine-release ]; then
-                      # alpine
+                  if [ -f /etc/alpine-release ]; then
+                      # Alpine
                       echo "$new_hostname" > /etc/hostname
-                      /etc/init.d/hostname restart
+                      hostname "$new_hostname"
                   else
-                      echo "未知的发行版，无法更改主机名。"
-                      exit 1
+                      # 其他系统，如 Debian, Ubuntu, CentOS 等
+                      hostnamectl set-hostname "$new_hostname"
+                      sed -i "s/$current_hostname/$new_hostname/g" /etc/hostname
+                      systemctl restart systemd-hostnamed
                   fi
-
-                  # 重启生效
-                  systemctl restart systemd-hostnamed
                   echo "主机名已更改为: $new_hostname"
               else
                   echo "无效的主机名。未更改主机名。"
@@ -4871,7 +4940,6 @@ EOF
           else
               echo "未更改主机名。"
           fi
-
               ;;
 
           19)
@@ -5132,8 +5200,121 @@ EOF
 
               ;;
 
-
           21)
+
+              while true; do
+                  clear
+                  echo "本机host解析列表"
+                  echo "如果你在这里添加解析匹配，将不再使用动态解析了"
+                  cat /etc/hosts
+                  echo ""
+                  echo "操作"
+                  echo "------------------------"
+                  echo "1. 添加新的解析              2. 删除解析地址"
+                  echo "------------------------"
+                  echo "0. 返回上一级选单"
+                  echo "------------------------"
+                  read -p "请输入你的选择: " host_dns
+
+                  case $host_dns in
+                      1)
+                          read -p "请输入新的解析记录 格式: 110.25.5.33 kejilion.pro : " addhost
+                          echo "$addhost" >> /etc/hosts
+
+                          ;;
+                      2)
+                          read -p "请输入需要删除的解析内容关键字: " delhost
+                          sed -i "/$delhost/d" /etc/hosts
+                          ;;
+                      0)
+                          break  # 跳出循环，退出菜单
+                          ;;
+
+                      *)
+                          break  # 跳出循环，退出菜单
+                          ;;
+                  esac
+              done
+              ;;
+
+          22)
+            if docker inspect fail2ban &>/dev/null || [ -x "$(command -v fail2ban-client)" ]; then
+                while true; do
+                    clear
+                    echo "SSH防御程序已启动"
+                    echo "------------------------"
+                    echo "1. 查看SSH拦截记录"
+                    echo "2. 日志实时监控"
+                    echo "------------------------"
+                    echo "9. 卸载防御程序"
+                    echo "------------------------"
+                    echo "0. 退出"
+                    echo "------------------------"
+                    read -p "请输入你的选择: " sub_choice
+                    case $sub_choice in
+
+                        1)
+                            echo "------------------------"
+                            f2b_sshd
+                            echo "------------------------"
+                            ;;
+                        2)
+                            tail -f /path/to/fail2ban/config/log/fail2ban/fail2ban.log
+                            break
+                            ;;
+                        9)
+                            docker rm -f fail2ban
+                            rm -rf /path/to/fail2ban
+                            remove fail2ban
+                            rm -rf /etc/fail2ban
+                            echo "重启后生效"
+                            server_reboot
+
+                            break
+                            ;;
+                        0)
+                            break
+                            ;;
+                        *)
+                            echo "无效的选择，请重新输入。"
+                            ;;
+                    esac
+                    break_end
+
+                done
+            else
+
+              clear
+              echo "fail2ban是一个SSH防止暴力破解工具"
+              echo "官网介绍: https://hub.gitmirror.com/https://github.com/fail2ban/fail2ban"
+              echo "------------------------------------------------"
+              echo "工作原理：研判非法IP恶意高频访问SSH端口，自动进行IP封锁"
+              echo "------------------------------------------------"
+              read -p "确定继续吗？(Y/N): " choice
+
+              case "$choice" in
+                [Yy])
+                  clear
+                  install_docker
+                  f2b_install_sshd
+
+                  cd ~
+                  f2b_status
+                  echo "Fail2Ban防御程序已开启，建议 reboot 重启服务器，完美适配系统。"
+                  server_reboot
+
+                  ;;
+                [Nn])
+                  echo "已取消"
+                  ;;
+                *)
+                  echo "无效的选择，请输入 Y 或 N。"
+                  ;;
+              esac
+            fi
+              ;;
+
+          31)
             clear
             install sshpass
 
@@ -5173,8 +5354,7 @@ EOF
 
           99)
               clear
-              echo "正在重启服务器，即将断开SSH连接"
-              reboot
+              server_reboot
               ;;
           0)
               kejilion
